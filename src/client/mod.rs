@@ -47,8 +47,9 @@ pub fn send(port: u16, name: Option<String>, message: String) -> Result<()> {
 // ─── watch ───────────────────────────────────────────────────────────────────
 
 /// `shpi watch`: open the FIFO for reading and stream frames as they arrive, flushing
-/// after each. Default output: `host \t body` line. With `osc99`: emit
-/// `\033]99;;<host>;<body>\033\\`. Blocks until interrupted. See `specs/cli.md`.
+/// after each. Default output: `host \t body` line. With `osc99`: emit a
+/// kitty desktop notification with `<host>` as title and `<body>` as body
+/// (two OSC-99 chunks). Blocks until interrupted. See `specs/cli.md`.
 pub fn watch(osc99: bool) -> Result<()> {
     let fifo = paths::fifo_path()?;
     if !fifo.exists() {
@@ -66,8 +67,17 @@ pub fn watch(osc99: bool) -> Result<()> {
             Ok(Some(fr)) => {
                 let body = String::from_utf8_lossy(&fr.body);
                 let write_result = if osc99 {
-                    // OSC-99: ESC ] 9 9 ; ; <host> ; <body> ESC \
-                    write!(out, "\x1b]99;;{};{}\x1b\\", fr.host, body)
+                    // OSC-99 (kitty desktop notifications): the single payload
+                    // field is the title by default. Title and body are sent as
+                    // two chunks sharing an identifier; `d=0` keeps the
+                    // notification open, `d=1` closes it.
+                    //   ESC]99;i=1:d=0:p=title;<host>ESC\
+                    //   ESC]99;i=1:d=1:p=body;<body>ESC\
+                    write!(
+                        out,
+                        "\x1b]99;i=1:d=0:p=title;{}\x1b\\\x1b]99;i=1:d=1:p=body;{}\x1b\\",
+                        fr.host, body
+                    )
                 } else {
                     writeln!(out, "{}\t{}", fr.host, body)
                 };
