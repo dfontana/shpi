@@ -40,18 +40,25 @@ already running" from "another process holds the port" (see [cli](./cli.md)).
 ## Receiving connections
 
 The daemon accepts many inbound TCP connections concurrently and continuously; one
-slow or long-lived connection must not block others. Each connection's bytes are decoded
-into messages per the framing in [requests](./requests.md) and written to the FIFO.
+slow or long-lived connection must not block others. Each connection carries exactly one
+message frame (see [requests](./requests.md)); the daemon reads the whole frame and
+forwards it, unchanged, to the FIFO without parsing its contents.
 
 ## Output FIFO
 
-Received messages are written, line by line, to `output.pipe`. `watch` reads from it.
+Received frames are forwarded, intact, to `output.pipe`. `watch` reads framed messages
+from it (see [requests](./requests.md)).
 
-Caveat: a FIFO open blocks until both a reader and a writer are present, and writes to a
-FIFO with no reader fail. The daemon must keep the FIFO usable regardless of whether any
-`watch` is currently running — it must neither block startup waiting for a reader nor
-crash when no reader is attached. (Holding the FIFO open for both reading and writing on
-the daemon side satisfies this.)
+Caveats:
+- A FIFO open blocks until both a reader and a writer are present, and writes to a FIFO
+  with no reader fail. The daemon must keep the FIFO usable regardless of whether any
+  `watch` is running — it must neither block startup waiting for a reader nor crash when
+  no reader is attached. (Holding the FIFO open for both reading and writing on the daemon
+  side satisfies this.)
+- Each frame must be written to the FIFO in a single write so concurrent readers cannot
+  interleave partial frames. Note the POSIX `PIPE_BUF` atomicity limit on write size.
+- A FIFO distributes bytes among readers; it does not broadcast. With multiple concurrent
+  `watch` consumers, each message goes to only one of them, not all.
 
 When no consumer is reading, messages may be dropped rather than buffered indefinitely;
 there is no persistence or history (out of scope).
@@ -60,10 +67,12 @@ there is no persistence or history (out of scope).
 
 The daemon holds live per-host tunnel state in memory and answers queries on the control
 socket. A `status` client connects, the daemon replies with a snapshot of current state,
-and the connection closes. Each reply describes, per host: its address, connection status
-(connected / reconnecting / failed), the time the current connection was established (while
-connected), and the retry attempt and next-retry time (while reconnecting). Absolute
-instants are reported so the client renders exact elapsed/remaining durations at read time.
+and the connection closes. The reply uses a simple text encoding (one record per host with
+fixed fields); no general serialization format is involved. Each reply describes, per host:
+its address, connection status (connected / reconnecting / failed), the time the current
+connection was established (while connected), and the retry attempt and next-retry time
+(while reconnecting). Absolute instants are reported so the client renders exact
+elapsed/remaining durations at read time.
 
 Serving the control socket must not block the daemon's other work, and a slow or stalled
 client must not stall message receiving or tunnel monitors.

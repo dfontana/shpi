@@ -10,8 +10,8 @@ portpipe
 ├── start <user@host>...   [--port] [--log]   # Mac side
 ├── stop
 ├── status
-├── watch
-└── send <message>         [--port]           # remote Linux side
+├── watch                  [--osc99]
+└── send <message>         [--port] [--name]   # remote Linux side
 ```
 
 ### `portpipe start [--port <PORT>] [--log <PATH>] <user@host>...`
@@ -53,29 +53,25 @@ Reports clearly when no daemon is running. This view should refresh itself until
 
 ### `portpipe watch`
 
-Streams messages received by the daemon to stdout, one per line, as they arrive, flushing
-after each message so that messages reach a downstream pipeline immediately even when
-stdout is a pipe rather than a terminal. Blocks until interrupted. Multiple concurrent
-`watch` invocations are permitted.
+Streams messages received by the daemon to stdout as they arrive, flushing after each
+message so it reaches a downstream pipeline immediately even when stdout is a pipe rather
+than a terminal. Blocks until interrupted. Multiple concurrent `watch` invocations are
+permitted (see the FIFO distribution caveat in [daemon](./daemon.md)).
 
-Designed to compose in a pipeline. For example, rendering each message as an OSC-99
-notification escape sequence:
+Output modes:
+- Default — one parseable line per message: the hostname and body separated by a tab.
+- `--osc99` — render each message as an OSC-99 notification escape sequence with the
+  hostname as the title and the body as the message:
+  `\033]99;;<hostname>;<body>\033\\`.
 
-```
-portpipe watch | jq --unbuffered -r '...' | \
-  while read -r line; do printf '\033]99;;%s\033\\' "$line"; done
-```
+### `portpipe send [--port <PORT>] [--name <NAME>] <message>`
 
-Note that downstream tools have their own buffering; portpipe guarantees only that it
-feeds the pipeline promptly. Tools like `jq` require their own unbuffering (e.g.
-`jq --unbuffered`, or `stdbuf -oL` for others) to forward each message as it arrives.
-
-### `portpipe send [--port <PORT>] <message>`
-
-Run on a remote Linux host. Sends a single UTF-8 message to the receiver through the
-SSH tunnel, which is always the localhost.
+Run on a remote Linux host. Sends a single message to the receiver through the SSH
+tunnel, which is always on localhost. The message frame carries the sender's hostname as
+metadata (see [requests](./requests.md)).
 
 - `--port <PORT>` — port to connect to. Default: `9292`.
+- `--name <NAME>` — hostname to attach to the message. Default: the system hostname.
 
 Exits non-zero with a clear error if the connection cannot be established (e.g. no tunnel
 present).
