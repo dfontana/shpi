@@ -1,6 +1,6 @@
 # Request Lifecycle Specification
 
-A "request" is a single message traveling from a remote host's `portpipe send` to a
+A "request" is a single message traveling from a remote host's `shpi send` to a
 `watch` consumer on the Mac. A message carries a body (the text being sent) and the
 sender's hostname as metadata. Messages are one-way; there is no reply.
 
@@ -22,7 +22,7 @@ contain any bytes, including newlines.
 
 ## Send side
 
-`portpipe send <message>` on a remote host:
+`shpi send <message>` on a remote host:
 
 1. Builds a frame with `host` = the sender's hostname (the system hostname by default,
    overridable via `--name`) and `body` = the message.

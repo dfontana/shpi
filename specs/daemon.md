@@ -11,10 +11,10 @@ The daemon owns a single data directory (under the user's $HOME/.cache/ director
 
 | File | Purpose |
 |---|---|
-| `portpipe.pid` | PID of the running daemon. Written at start, removed at stop. |
+| `shpi.pid` | PID of the running daemon. Written at start, removed at stop. |
 | `output.pipe` | FIFO carrying received messages to `watch` consumers. |
 | `control.sock` | Unix-domain socket the daemon serves to answer `status` queries. |
-| `portpipe.log` | Daemon log (also the daemon's redirected stdout/stderr). |
+| `shpi.log` | Daemon log (also the daemon's redirected stdout/stderr). |
 
 The directory, FIFO, and control socket are created if absent during startup. A stale
 control socket left by a prior unclean exit must be removed and re-bound on startup.
@@ -34,7 +34,7 @@ control socket left by a prior unclean exit must be removed and re-bound on star
 7. Begin accepting connections, serve the control socket, start one SSH tunnel monitor per
    host, and install the signal handler.
 
-If the port is already in use, startup fails with an error distinguishing "portpipe
+If the port is already in use, startup fails with an error distinguishing "shpi
 already running" from "another process holds the port" (see [cli](./cli.md)).
 
 ## Receiving connections
