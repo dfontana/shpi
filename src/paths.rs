@@ -1,10 +1,10 @@
 //! Locations of the files the daemon owns, all under `$HOME/.cache/shpi`.
 
-use crate::error::{Error, Result};
+use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
 pub fn data_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| Error::msg("HOME is not set"))?;
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
     Ok(PathBuf::from(home).join(".cache").join("shpi"))
 }
 

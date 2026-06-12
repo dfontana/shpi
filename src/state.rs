@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub enum TunnelStatus {
     Connected {
         since: SystemTime,
@@ -21,10 +21,22 @@ pub enum TunnelStatus {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct HostReport {
     pub addr: String,
     pub status: TunnelStatus,
+}
+
+/// Encode a status snapshot for the control-socket reply.
+pub fn encode_report(hosts: &[HostReport]) -> Vec<u8> {
+    bincode::encode_to_vec(hosts, bincode::config::standard()).expect("report encode is infallible")
+}
+
+/// Decode a control-socket reply; a malformed reply yields an empty report.
+pub fn decode_report(bytes: &[u8]) -> Vec<HostReport> {
+    bincode::decode_from_slice(bytes, bincode::config::standard())
+        .map(|(hosts, _)| hosts)
+        .unwrap_or_default()
 }
 
 /// Cloneable shared handle to every host's current status.

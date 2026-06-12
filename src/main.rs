@@ -1,10 +1,8 @@
 mod client;
 mod daemon;
-mod error;
 mod frame;
 mod paths;
 mod pidfile;
-mod protocol;
 mod state;
 
 use argh::FromArgs;
@@ -82,7 +80,7 @@ fn main() {
     let result = match cli.cmd {
         Cmd::Start(c) => {
             if c.hosts.is_empty() {
-                Err(error::Error::msg("at least one user@host is required"))
+                Err(anyhow::anyhow!("at least one user@host is required"))
             } else {
                 daemon::run_start(c.port, c.log, c.hosts)
             }

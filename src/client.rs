@@ -8,18 +8,17 @@
 //! - [`crate::state`] — `HostReport` / `TunnelStatus` types.
 //! - [`crate::paths`] — file locations (`pid_file`, `fifo_path`, `control_sock`).
 
-use crate::error::{Error, Result};
 use crate::frame;
 use crate::paths;
 use crate::pidfile;
-use crate::protocol;
-use crate::state::TunnelStatus;
+use crate::state::{self, TunnelStatus};
+use anyhow::{Context, Result, anyhow};
+use nix::sys::signal;
+use nix::sys::signal::Signal;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, SystemTime};
-
-// ─── send ────────────────────────────────────────────────────────────────────
 
 /// `shpi send`: build one frame (host = `name` or the system hostname, body = `message`),
 /// open a TCP connection to `127.0.0.1:port`, write the single frame, close. See
@@ -27,24 +26,21 @@ use std::time::{Duration, SystemTime};
 pub fn send(port: u16, name: Option<String>, message: String) -> Result<()> {
     let host = match name {
         Some(n) => n,
-        None => {
-            let raw = nix::unistd::gethostname()
-                .map_err(|e| Error::msg(format!("could not get hostname: {e}")))?;
-            raw.to_string_lossy().into_owned()
-        }
+        None => nix::unistd::gethostname()
+            .context("could not get hostname")?
+            .to_string_lossy()
+            .into_owned(),
     };
 
     let addr = format!("127.0.0.1:{port}");
     let mut stream = TcpStream::connect(&addr)
-        .map_err(|_| Error::msg(format!("could not connect to {addr} (is a tunnel up?)")))?;
+        .with_context(|| format!("could not connect to {addr} (is a tunnel up?)"))?;
 
     let frame_bytes = frame::encode_frame(&host, message.as_bytes());
     stream.write_all(&frame_bytes)?;
     // Dropping `stream` closes the connection — exactly one frame per connection.
     Ok(())
 }
-
-// ─── watch ───────────────────────────────────────────────────────────────────
 
 /// `shpi watch`: open the FIFO for reading and stream frames as they arrive, flushing
 /// after each. Default output: `host \t body` line. With `osc99`: emit a
@@ -53,8 +49,8 @@ pub fn send(port: u16, name: Option<String>, message: String) -> Result<()> {
 pub fn watch(osc99: bool) -> Result<()> {
     let fifo = paths::fifo_path()?;
     if !fifo.exists() {
-        return Err(Error::msg(
-            "FIFO not found — is the shpi daemon running? (start it with `shpi start`)",
+        return Err(anyhow!(
+            "FIFO not found — is the shpi daemon running? (start it with `shpi start`)"
         ));
     }
 
@@ -103,8 +99,6 @@ fn stop_on_broken_pipe(r: io::Result<()>) -> Result<bool> {
         Err(e) => Err(e.into()),
     }
 }
-
-// ─── status ──────────────────────────────────────────────────────────────────
 
 /// `shpi status`: query the daemon's control socket, decode the reply, and print a
 /// human-readable per-host summary (plus the daemon pid line read from the pid file).
@@ -156,7 +150,7 @@ fn render_status<W: Write>(out: &mut W) -> Result<()> {
                     out,
                     "{addr_col:<24} {:<14}({})",
                     "connected",
-                    fmt_duration(elapsed)
+                    humantime::format_duration(elapsed)
                 )?;
             }
             TunnelStatus::Reconnecting {
@@ -168,7 +162,7 @@ fn render_status<W: Write>(out: &mut W) -> Result<()> {
                     out,
                     "{addr_col:<24} {:<14}(attempt {attempt}, next retry in {})",
                     "reconnecting",
-                    fmt_duration(remaining)
+                    humantime::format_duration(remaining)
                 )?;
             }
             TunnelStatus::Failed { reason } => {
@@ -183,15 +177,13 @@ fn render_status<W: Write>(out: &mut W) -> Result<()> {
 /// Open the control socket, read the full reply, and decode it.
 fn query_control_socket() -> Result<Vec<crate::state::HostReport>> {
     let sock_path = paths::control_sock()?;
-    let mut stream = UnixStream::connect(&sock_path)
-        .map_err(|e| Error::msg(format!("could not connect to control socket: {e}")))?;
+    let mut stream =
+        UnixStream::connect(&sock_path).context("could not connect to control socket")?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-    let mut reply = String::new();
-    stream.read_to_string(&mut reply)?;
-    Ok(protocol::decode_report(&reply))
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply)?;
+    Ok(state::decode_report(&reply))
 }
-
-// ─── stop ────────────────────────────────────────────────────────────────────
 
 /// `shpi stop`: read the pid file, SIGTERM the daemon, escalate to SIGKILL after a short
 /// grace period if still alive, remove the pid file if it remains. Succeed quietly if no
@@ -208,7 +200,7 @@ pub fn stop() -> Result<()> {
     }
 
     // Send SIGTERM, then poll for up to ~2 s (20 × 100 ms).
-    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+    let _ = signal::kill(pid, Signal::SIGTERM);
     let mut alive = true;
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(100));
@@ -220,73 +212,10 @@ pub fn stop() -> Result<()> {
 
     if alive {
         // Escalate to SIGKILL, then give the kernel a moment to reap the process.
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        let _ = signal::kill(pid, Signal::SIGKILL);
         std::thread::sleep(Duration::from_millis(100));
     }
 
     pidfile::remove();
     Ok(())
-}
-
-// ─── duration formatting ─────────────────────────────────────────────────────
-
-/// Format a [`Duration`] as a compact human string: `3h 22m`, `45s`, `2d 4h`, etc.
-///
-/// Rules:
-/// - `>= 1 day`:   `{d}d {h}h` (hours component omitted when zero).
-/// - `>= 1 hour`:  `{h}h {m}m` (minutes component omitted when zero).
-/// - `>= 1 min`:   `{m}m {s}s` (seconds component omitted when zero).
-/// - otherwise:    `{s}s`.
-fn fmt_duration(d: Duration) -> String {
-    let total = d.as_secs();
-    let days = total / 86400;
-    let hours = (total % 86400) / 3600;
-    let mins = (total % 3600) / 60;
-    let secs = total % 60;
-
-    if days > 0 {
-        if hours > 0 {
-            format!("{days}d {hours}h")
-        } else {
-            format!("{days}d")
-        }
-    } else if hours > 0 {
-        if mins > 0 {
-            format!("{hours}h {mins}m")
-        } else {
-            format!("{hours}h")
-        }
-    } else if mins > 0 {
-        if secs > 0 {
-            format!("{mins}m {secs}s")
-        } else {
-            format!("{mins}m")
-        }
-    } else {
-        format!("{secs}s")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fmt_duration_samples() {
-        assert_eq!(fmt_duration(Duration::from_secs(0)), "0s");
-        assert_eq!(fmt_duration(Duration::from_secs(45)), "45s");
-        assert_eq!(fmt_duration(Duration::from_secs(60)), "1m");
-        assert_eq!(fmt_duration(Duration::from_secs(65)), "1m 5s");
-        assert_eq!(fmt_duration(Duration::from_secs(3600)), "1h");
-        assert_eq!(fmt_duration(Duration::from_secs(3600 + 22 * 60)), "1h 22m");
-        assert_eq!(
-            fmt_duration(Duration::from_secs(3 * 3600 + 22 * 60)),
-            "3h 22m"
-        );
-        assert_eq!(
-            fmt_duration(Duration::from_secs(2 * 86400 + 4 * 3600)),
-            "2d 4h"
-        );
-        assert_eq!(fmt_duration(Duration::from_secs(2 * 86400)), "2d");
-    }
 }

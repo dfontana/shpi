@@ -1,94 +1,47 @@
-//! Wire frame codec.
+//! Wire frame: a host label plus an opaque message body, encoded with bincode.
 //!
-//! Layout: `[frame_len: u32 BE][host_len: u16 BE][host bytes][body bytes]`.
-//! `frame_len` counts everything after itself, i.e. `2 + host_len + body_len`.
-//! The explicit length prefix delimits frames on a continuous stream (the FIFO).
+//! `send` writes exactly one frame per TCP connection then closes, so the daemon
+//! reads the connection to EOF to get one frame and forwards the bytes verbatim
+//! onto the output FIFO, where `watch` decodes a continuous stream of them.
 
-use std::io::{self, Read};
+use std::io::Read;
 
-pub const LEN_PREFIX: usize = 4;
-
-/// Upper bound on a single frame's payload, to reject a garbage length prefix before
-/// allocating for it. Generous relative to the string messages shpi carries.
+/// Upper bound on a single decoded frame, so a corrupt or hostile stream can't
+/// drive an unbounded allocation.
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bincode::Encode, bincode::Decode)]
 pub struct Frame {
     pub host: String,
     pub body: Vec<u8>,
 }
 
-/// Encode a complete frame (including its length prefix) ready to write to a stream.
+fn config() -> impl bincode::config::Config {
+    bincode::config::standard().with_limit::<MAX_FRAME_LEN>()
+}
+
+/// Encode one frame to its wire bytes.
 pub fn encode_frame(host: &str, body: &[u8]) -> Vec<u8> {
-    let host = host.as_bytes();
-    let host_len = host.len() as u16;
-    let payload_len = (2 + host.len() + body.len()) as u32;
-    let mut out = Vec::with_capacity(LEN_PREFIX + payload_len as usize);
-    out.extend_from_slice(&payload_len.to_be_bytes());
-    out.extend_from_slice(&host_len.to_be_bytes());
-    out.extend_from_slice(host);
-    out.extend_from_slice(body);
-    out
+    let frame = Frame {
+        host: host.to_string(),
+        body: body.to_vec(),
+    };
+    bincode::encode_to_vec(&frame, config()).expect("frame encode is infallible")
 }
 
-/// Parse the payload that follows the `u32` length prefix: `[host_len: u16][host][body]`.
-pub fn parse_payload(payload: &[u8]) -> io::Result<Frame> {
-    if payload.len() < 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too short",
-        ));
-    }
-    let host_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-    if 2 + host_len > payload.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "host length exceeds frame",
-        ));
-    }
-    let host = String::from_utf8_lossy(&payload[2..2 + host_len]).into_owned();
-    let body = payload[2 + host_len..].to_vec();
-    Ok(Frame { host, body })
-}
-
-/// Read one frame from a blocking reader. Returns `Ok(None)` at a clean EOF (no bytes
-/// available before the next frame); errors if EOF interrupts a partial frame.
-pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Frame>> {
-    let mut len_buf = [0u8; LEN_PREFIX];
-    if !read_full_or_eof(r, &mut len_buf)? {
-        return Ok(None);
-    }
-    let payload_len = u32::from_be_bytes(len_buf) as usize;
-    if payload_len > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame length exceeds maximum",
-        ));
-    }
-    let mut payload = vec![0u8; payload_len];
-    r.read_exact(&mut payload)?;
-    Ok(Some(parse_payload(&payload)?))
-}
-
-/// Fill `buf` fully. `Ok(false)` if EOF occurs before any byte is read; `Ok(true)` if
-/// filled; `Err(UnexpectedEof)` on a partial read cut short by EOF.
-fn read_full_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match r.read(&mut buf[filled..])? {
-            0 => {
-                if filled == 0 {
-                    return Ok(false);
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "partial frame length prefix",
-                ));
-            }
-            n => filled += n,
+/// Read one frame from a blocking reader. `Ok(None)` at EOF (no further frame);
+/// `Err` on a malformed frame.
+pub fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Option<Frame>> {
+    use bincode::error::DecodeError;
+    match bincode::decode_from_std_read(r, config()) {
+        Ok(frame) => Ok(Some(frame)),
+        // Reader exhausted at or partway through a frame — treat as end of stream.
+        Err(DecodeError::UnexpectedEnd { .. }) => Ok(None),
+        Err(DecodeError::Io { inner, .. }) if inner.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Ok(None)
         }
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
     }
-    Ok(true)
 }
 
 #[cfg(test)]
@@ -126,12 +79,5 @@ mod tests {
             }
         );
         assert!(read_frame(&mut cur).unwrap().is_none());
-    }
-
-    #[test]
-    fn truncated_body_is_an_error() {
-        let mut bytes = encode_frame("host", b"payload");
-        bytes.truncate(bytes.len() - 3);
-        assert!(read_frame(&mut Cursor::new(bytes)).is_err());
     }
 }

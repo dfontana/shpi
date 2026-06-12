@@ -4,9 +4,9 @@
 //!
 //! See `specs/daemon.md` and `specs/ssh-connection.md`.
 
-use crate::error::{Error, Result};
-use crate::frame::{self, LEN_PREFIX};
-use crate::{paths, pidfile, protocol, state};
+use anyhow::{Context, Result, anyhow};
+use crate::frame;
+use crate::{paths, pidfile, state};
 use nix::sys::signal::{SigSet, Signal};
 use nix::unistd::Pid;
 use smol::channel::{self, Sender};
@@ -43,7 +43,7 @@ pub fn run_start(port: u16, log: Option<PathBuf>, hosts: Vec<String>) -> Result<
     let pid_path = paths::pid_file()?;
     if let Some(pid) = pidfile::read() {
         if pidfile::is_alive(pid) {
-            return Err(Error::msg(format!("shpi is already running (pid {pid})")));
+            return Err(anyhow!("shpi is already running (pid {pid})"));
         }
         // Stale pid file — remove it so daemonize can write a fresh one.
         let _ = std::fs::remove_file(&pid_path);
@@ -54,15 +54,15 @@ pub fn run_start(port: u16, log: Option<PathBuf>, hosts: Vec<String>) -> Result<
     let fifo = paths::fifo_path()?;
     if !fifo.exists() {
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
-            .map_err(|e| Error::msg(format!("mkfifo: {e}")))?;
+            .context("mkfifo")?;
     }
 
     // --- 3. Bind the TCP listener before daemonizing so errors surface on the terminal ---
     let std_listener = StdTcpListener::bind(("127.0.0.1", port)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AddrInUse {
-            Error::msg(format!("port {port} is already in use by another process"))
+            anyhow!("port {port} is already in use by another process")
         } else {
-            Error::from(e)
+            anyhow::Error::from(e)
         }
     })?;
 
@@ -82,7 +82,7 @@ pub fn run_start(port: u16, log: Option<PathBuf>, hosts: Vec<String>) -> Result<
         .stdout(log_file)
         .stderr(log_file2)
         .start()
-        .map_err(|e| Error::msg(format!("daemonize: {e}")))?;
+        .context("daemonize")?;
 
     // --- 5. (Daemonized child) Block SIGTERM/SIGINT before starting any async threads ---
     let mut sigset = SigSet::empty();
@@ -90,7 +90,7 @@ pub fn run_start(port: u16, log: Option<PathBuf>, hosts: Vec<String>) -> Result<
     sigset.add(Signal::SIGINT);
     sigset
         .thread_block()
-        .map_err(|e| Error::msg(format!("sigprocmask: {e}")))?;
+        .context("sigprocmask")?;
 
     // --- 6. Control socket: remove stale, then bind ---
     let sock_path = paths::control_sock()?;
@@ -99,7 +99,7 @@ pub fn run_start(port: u16, log: Option<PathBuf>, hosts: Vec<String>) -> Result<
     }
     // Bind synchronously so we own the path before spawning anything.
     let unix_listener = UnixListener::bind(&sock_path)
-        .map_err(|e| Error::msg(format!("control socket bind: {e}")))?;
+        .context("control socket bind")?;
 
     // --- 7. Shared state ---
     let shared = state::SharedState::new(&hosts);
@@ -230,25 +230,13 @@ pub fn run_start(port: u16, log: Option<PathBuf>, hosts: Vec<String>) -> Result<
     Ok(())
 }
 
-/// Read exactly one frame from a TCP connection and forward it to the FIFO channel.
+/// Read one frame from a TCP connection and forward its bytes to the FIFO channel.
+/// `send` writes a single frame then closes, so reading to EOF (bounded by
+/// `MAX_FRAME_LEN`) yields exactly that frame, which we forward verbatim.
 async fn handle_connection(stream: Async<std::net::TcpStream>, fifo_tx: Sender<Vec<u8>>) {
-    let mut s = stream;
-
-    // Read the 4-byte big-endian frame_len.
-    let mut len_buf = [0u8; LEN_PREFIX];
-    if s.read_exact(&mut len_buf).await.is_err() {
-        return;
-    }
-    let frame_len = u32::from_be_bytes(len_buf) as usize;
-    if frame_len > frame::MAX_FRAME_LEN {
-        return; // reject an implausible length rather than allocating for it
-    }
-
-    // Allocate the full frame once (prefix + payload) and read the payload straight
-    // into place, so the FIFO writer receives the bytes verbatim.
-    let mut buf = vec![0u8; LEN_PREFIX + frame_len];
-    buf[..LEN_PREFIX].copy_from_slice(&len_buf);
-    if s.read_exact(&mut buf[LEN_PREFIX..]).await.is_err() {
+    let mut buf = Vec::new();
+    let mut limited = stream.take(frame::MAX_FRAME_LEN as u64);
+    if limited.read_to_end(&mut buf).await.is_err() || buf.is_empty() {
         return;
     }
     let _ = fifo_tx.try_send(buf);
@@ -257,8 +245,8 @@ async fn handle_connection(stream: Async<std::net::TcpStream>, fifo_tx: Sender<V
 /// Serve one control-socket connection: snapshot state, encode, write, close.
 async fn handle_control(mut stream: smol::net::unix::UnixStream, shared: state::SharedState) {
     let snapshot = shared.snapshot();
-    let reply = protocol::encode_report(&snapshot);
-    let _ = stream.write_all(reply.as_bytes()).await;
+    let reply = state::encode_report(&snapshot);
+    let _ = stream.write_all(&reply).await;
 }
 
 /// Mark host `idx` as reconnecting, sleep for the current `backoff`, then double it
